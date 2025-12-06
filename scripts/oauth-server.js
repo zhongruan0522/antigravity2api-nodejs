@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import readline from 'readline';
 import log from '../src/utils/logger.js';
 import { buildAuthUrl, exchangeCodeForToken } from '../src/auth/oauth_client.js';
+import { resolveProjectIdFromAccessToken } from '../src/auth/project_id_resolver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -83,12 +84,25 @@ server.listen(0, () => {
     try {
       log.info('正在交换 Token...');
       const tokenData = await exchangeCodeForToken(code, finalRedirectUri);
+
+      let projectId = null;
+      if (tokenData?.access_token) {
+        const result = await resolveProjectIdFromAccessToken(tokenData.access_token);
+        if (result.projectId) {
+          projectId = result.projectId;
+        }
+      }
+
       const account = {
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token,
         expires_in: tokenData.expires_in,
         timestamp: Date.now()
       };
+
+      if (projectId) {
+        account.projectId = projectId;
+      }
 
       let accounts = [];
       try {
@@ -118,4 +132,3 @@ server.listen(0, () => {
     }
   });
 });
-

@@ -225,6 +225,40 @@ function bindAccountActions() {
       loginBtn?.click();
     });
   });
+
+  document.querySelectorAll('[data-action="refreshProjectId"]')?.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = btn.dataset.index;
+      if (idx === undefined) return;
+
+      btn.disabled = true;
+      setStatus(`正在刷新账号 #${Number(idx) + 1} 的项目ID...`, 'info', manageStatusEl);
+
+      try {
+        const res = await fetch('/auth/accounts/' + idx + '/refresh-project-id', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' }
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+
+        setStatus(
+          `项目ID 已刷新为：${data.projectId || '未知'}`,
+          'success',
+          manageStatusEl
+        );
+        await refreshAccounts();
+      } catch (e) {
+        setStatus('刷新项目ID失败: ' + e.message, 'error', manageStatusEl);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 async function refreshAccounts() {
@@ -258,13 +292,15 @@ function renderAccountsList() {
       const statusClass = acc.enable ? 'status-ok' : 'status-off';
       const statusText = acc.enable ? '启用中' : '已停用';
       const displayName = escapeHtml(getAccountDisplayName(acc));
+      const projectId = acc.projectId ? escapeHtml(acc.projectId) : null;
       return `
         <div class="account-item">
           <div class="account-header">
             <div class="account-info">
-              <div class="account-title">${displayName}${
-        acc.projectId ? ` <span class="badge">${acc.projectId}</span>` : ''
-      }</div>
+              <div class="account-title">
+                ${displayName}
+                ${projectId ? `<span class="badge">${projectId}</span>` : ''}
+              </div>
               <div class="account-meta">创建时间：${created}</div>
             </div>
             <div class="account-status">
@@ -287,6 +323,9 @@ function renderAccountsList() {
       }</button>
                 <button class="mini-btn" data-action="reauthorize" data-index="${acc.index}">🔑 重新授权</button>
                 <button class="mini-btn danger" data-action="delete" data-index="${acc.index}">🗑️ 删除</button>
+              </div>
+              <div class="action-row secondary">
+                <button class="mini-btn" data-action="refreshProjectId" data-index="${acc.index}">🔄 刷新项目ID</button>
               </div>
             </div>
           </div>

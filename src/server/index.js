@@ -17,6 +17,7 @@ import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import tokenManager from '../auth/token_manager.js';
 import { buildAuthUrl, exchangeCodeForToken } from '../auth/oauth_client.js';
+import { resolveProjectIdFromAccessToken } from '../auth/project_id_resolver.js';
 import {
   appendLog,
   getLogDetail,
@@ -755,12 +756,25 @@ app.post('/auth/oauth/parse-url', requirePanelAuthApi, async (req, res) => {
 
   try {
     const tokenData = await exchangeCodeForToken(code, redirectUri);
+
+    let projectId = null;
+    if (tokenData?.access_token) {
+      const result = await resolveProjectIdFromAccessToken(tokenData.access_token);
+      if (result.projectId) {
+        projectId = result.projectId;
+      }
+    }
+
     const account = {
       access_token: tokenData.access_token,
       refresh_token: tokenData.refresh_token,
       expires_in: tokenData.expires_in,
       timestamp: Date.now()
     };
+
+    if (projectId) {
+      account.projectId = projectId;
+    }
 
     let accounts = [];
     try {
@@ -938,6 +952,71 @@ app.post('/auth/accounts/:index/refresh', requirePanelAuthApi, async (req, res) 
   }
 });
 
+app.post('/auth/accounts/:index/refresh-project-id', requirePanelAuthApi, async (req, res) => {
+  const index = Number.parseInt(req.params.index, 10);
+  if (Number.isNaN(index)) return res.status(400).json({ error: 'invalid account index' });
+
+  try {
+    if (!fs.existsSync(ACCOUNTS_FILE)) {
+      return res.status(404).json({ error: 'accounts.json not found' });
+    }
+
+    const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    const target = accounts[index];
+    if (!target) return res.status(404).json({ error: 'account not found' });
+
+    let accessToken = target.access_token;
+
+    if (!accessToken && target.refresh_token) {
+      try {
+        await tokenManager.refreshToken(target);
+        accessToken = target.access_token;
+      } catch (err) {
+        logger.error('failed to refresh token before resolving project id', err.message);
+        return res
+          .status(500)
+          .json({ error: err?.message || 'failed to refresh token for this account' });
+      }
+    }
+
+    if (!accessToken) {
+      return res
+        .status(400)
+        .json({ error: 'no usable access token for this account' });
+    }
+
+    const result = await resolveProjectIdFromAccessToken(accessToken);
+    if (!result.projectId) {
+      const errorMessage =
+        result.error?.message ||
+        'failed to resolve project id from Resource Manager';
+      logger.warn(
+        'refresh project id failed: unable to resolve project id from Resource Manager',
+        errorMessage
+      );
+      return res.status(500).json({ error: errorMessage });
+    }
+
+    target.projectId = result.projectId;
+    accounts[index] = target;
+
+    const dir = path.dirname(ACCOUNTS_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf-8');
+
+    if (typeof tokenManager.initialize === 'function') {
+      tokenManager.initialize();
+    }
+
+    return res.json({ success: true, projectId: result.projectId });
+  } catch (e) {
+    logger.error('refresh project id failed', e.message);
+    return res.status(500).json({ error: e.message || 'refresh project id failed' });
+  }
+});
+
 // Delete an account
 app.delete('/auth/accounts/:index', requirePanelAuthApi, (req, res) => {
   const index = Number.parseInt(req.params.index, 10);
@@ -1112,12 +1191,27 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
         let hasToolCall = false;
         const { usage } = await generateAssistantResponse(requestBody, token, data => {
           streamEventsForLog.push(data);
-          const delta =
-            data.type === 'tool_calls'
-              ? { tool_calls: data.tool_calls }
-              : { content: data.content };
-          if (data.type === 'tool_calls') hasToolCall = true;
-          writeStreamData(res, createStreamChunk(id, created, model, delta));
+
+          let delta = {};
+          if (data.type === 'tool_calls') {
+            delta = { tool_calls: data.tool_calls };
+          } else if (data.type === 'thinking') {
+            // 思维链内容直接放入 reasoning_content（不包含标签）
+            const cleanContent = data.content.replace(/^<思考>\n?|\n?<\/思考>$/g, '');
+            delta = { reasoning_content: cleanContent };
+          } else if (data.type === 'text') {
+            // 普通文本内容放入 content（需要过滤掉思考标签）
+            const cleanContent = data.content.replace(/<思考>[\s\S]*?<\/思考>/g, '');
+            if (cleanContent) {
+              delta = { content: cleanContent };
+            }
+          }
+
+          // 只有当 delta 有内容时才发送
+          if (Object.keys(delta).length > 0) {
+            if (data.type === 'tool_calls') hasToolCall = true;
+            writeStreamData(res, createStreamChunk(id, created, model, delta));
+          }
         });
         endStream(res, id, created, model, hasToolCall ? 'tool_calls' : 'stop', usage);
         responseBodyForLog = { stream: true, events: streamEventsForLog, usage };
